@@ -9,3 +9,5 @@ Reduced loop unrolling
 
 Detailed explanations of these optimizations available in the official whitepaper: http://www.intel.com/content/dam/www/public/us/en/documents/white-papers/zlib-compression-whitepaper-copy.pdf
 
+The contents of this directory are supplied from:
+https://github.com/jtkukunas/zlib/releases/tag/v1.2.12_jtk.1 (bf55d56b068467329f5a6f29bee31bc80d694023)
