@@ -1,0 +1,105 @@
+name: Build Failure Analysis Smoke Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ADO_API: https://dev.azure.com/dnceng-public/public/_apis
+      BUILD_ID: "1561838"
+      EXPECTED_ARTIFACT: Logs_Build_Attempt1_wasi_wasm_linux_Release_CoreCLR_WASI_RuntimeTests
+      BINLOG_MCP_IMAGE: mcr.microsoft.com/dotnet-buildtools/prereqs:azurelinux-3.0-binlog-mcp-amd64@sha256:253736e28e0230269dfcdb70f5027da47e2e45e8526d15d6485ca08b2c2f1638
+    steps:
+      - name: Select and download a failed-job binlog
+        id: binlog
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          timeline_json=$(curl -sSL --fail --retry 3 \
+            "${ADO_API}/build/builds/${BUILD_ID}/timeline?api-version=7.1")
+          artifacts_json=$(curl -sSL --fail --retry 3 \
+            "${ADO_API}/build/builds/${BUILD_ID}/artifacts?api-version=7.1")
+
+          mapfile -t failed_job_keys < <(
+            printf '%s' "${timeline_json}" |
+              jq -r '.records // [] | map(select(.type == "Job" and (.result == "failed" or .result == "canceled"))) | .[].name' |
+              while IFS= read -r job_name; do
+                printf '%s' "${job_name}" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]'
+                printf '\n'
+              done |
+              awk 'NF && !seen[$0]++'
+          )
+
+          mapfile -t all_names < <(
+            printf '%s' "${artifacts_json}" |
+              jq -r '.value // [] | map(select(.name | test("^Logs_Build_"))) | .[].name'
+          )
+          mapfile -t names < <(
+            for name in "${all_names[@]}"; do
+              artifact_job_name=$(printf '%s' "${name}" | sed -E 's/^Logs_Build_(Attempt[0-9]+_)?//')
+              artifact_key=$(printf '%s' "${artifact_job_name}" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')
+              for job_key in "${failed_job_keys[@]}"; do
+                if [[ "${artifact_key}" == "${job_key}" ]]; then
+                  printf '%s\n' "${name}"
+                  break
+                fi
+              done
+            done
+          )
+
+          printf 'Selected failed-job artifacts:\n'
+          printf '  %s\n' "${names[@]}"
+          test "${#names[@]}" -eq 9
+          ! printf '%s\n' "${names[@]}" | grep -q 'NativeAOT_Libraries'
+          printf '%s\n' "${names[@]}" | grep -Fxq "${EXPECTED_ARTIFACT}"
+
+          download_url=$(printf '%s' "${artifacts_json}" |
+            jq -er --arg name "${EXPECTED_ARTIFACT}" \
+              '.value[] | select(.name == $name) | .resource.downloadUrl')
+          mkdir -p "${RUNNER_TEMP}/binlogs"
+          curl -sSL --fail --retry 3 --max-time 600 \
+            --output "${RUNNER_TEMP}/artifact.zip" "${download_url}"
+          unzip -j "${RUNNER_TEMP}/artifact.zip" '*.binlog' -d "${RUNNER_TEMP}/binlogs"
+
+          binlog_path=$(find "${RUNNER_TEMP}/binlogs" -maxdepth 1 -type f -name '*.binlog' -print -quit)
+          test -n "${binlog_path}"
+          echo "binlog-name=$(basename "${binlog_path}")" >> "${GITHUB_OUTPUT}"
+          ls -lh "${binlog_path}"
+
+      - name: Query the binlog through the pinned MCP container
+        shell: bash
+        env:
+          BINLOG_NAME: ${{ steps.binlog.outputs.binlog-name }}
+        run: |
+          set -euo pipefail
+
+          docker pull "${BINLOG_MCP_IMAGE}"
+          cat > "${RUNNER_TEMP}/mcp-requests.jsonl" <<EOF
+          {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"runtime-build-failure-smoke","version":"1.0"}}}
+          {"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+          {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+          {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"binlog_overview","arguments":{"binlog_file":"/binlogs/${BINLOG_NAME}"}}}
+          EOF
+
+          docker run --rm -i \
+            -v "${RUNNER_TEMP}/binlogs:/binlogs:ro" \
+            "${BINLOG_MCP_IMAGE}" \
+            < "${RUNNER_TEMP}/mcp-requests.jsonl" \
+            > "${RUNNER_TEMP}/mcp-responses.jsonl"
+
+          cat "${RUNNER_TEMP}/mcp-responses.jsonl"
+          jq -s -e \
+            'map(select(.id == 2))[0].result.tools | any(.name == "binlog_overview")' \
+            "${RUNNER_TEMP}/mcp-responses.jsonl"
+          jq -s -e \
+            'map(select(.id == 3))[0] |
+              (.result.isError // false) == false and
+              (.result.content | length > 0)' \
+            "${RUNNER_TEMP}/mcp-responses.jsonl"
