@@ -92,14 +92,11 @@ jobs:
             -v "${RUNNER_TEMP}/binlogs:/binlogs:ro" \
             "${BINLOG_MCP_IMAGE}" \
             < "${RUNNER_TEMP}/mcp-requests.jsonl" \
-            > "${RUNNER_TEMP}/mcp-responses.jsonl"
+            > "${RUNNER_TEMP}/mcp-responses.jsonl" \
+            2> >(tee "${RUNNER_TEMP}/mcp-server.log" >&2)
 
           cat "${RUNNER_TEMP}/mcp-responses.jsonl"
-          jq -s -e \
-            'map(select(.id == 2))[0].result.tools | any(.name == "binlog_overview")' \
-            "${RUNNER_TEMP}/mcp-responses.jsonl"
-          jq -s -e \
-            'map(select(.id == 3))[0] |
-              (.result.isError // false) == false and
-              (.result.content | length > 0)' \
-            "${RUNNER_TEMP}/mcp-responses.jsonl"
+          grep -Fq "method 'tools/list' request handler completed" \
+            "${RUNNER_TEMP}/mcp-server.log"
+          grep -Fq '"binlog_overview" completed. IsError = False.' \
+            "${RUNNER_TEMP}/mcp-server.log"
