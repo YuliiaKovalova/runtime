@@ -50,6 +50,11 @@ on:
         description: "Mirrored fork PR number to analyze and post the result on."
         required: true
         type: string
+      force-hlx-only:
+        description: "Fork E2E only: skip matching artifacts to exercise the hlx-only path."
+        required: false
+        default: false
+        type: boolean
   # Gate the whole AI pipeline on the fetch job so the agent only runs after the
   # failed Azure DevOps build and target revision have been verified.
   needs: [fetch-binlog]
@@ -173,6 +178,7 @@ jobs:
           DISPATCH_BUILD_ID: ${{ inputs['ado-build-id'] }}
           DISPATCH_ADO_PR_NUMBER: ${{ inputs['ado-pr-number'] }}
           DISPATCH_PR_NUMBER: ${{ inputs['pr-number'] }}
+          FORCE_HLX_ONLY: ${{ inputs['force-hlx-only'] }}
         run: |
           # Advisory + fail-closed: on any validation gap keep the agent inert.
           set +e
@@ -380,6 +386,10 @@ jobs:
               done
             done
           )
+          if [ "${FORCE_HLX_ONLY:-false}" = "true" ]; then
+            echo "::notice::Fork E2E override: skipping artifact staging to exercise the hlx-only path."
+            names=()
+          fi
           if [ "${#names[@]}" -eq 0 ]; then
             echo "::warning::No Logs_Build_* artifacts mapped unambiguously to failed or canceled jobs in build ${BUILD_ID}; the agent will inspect failed compile-task logs through hlx."
           else
