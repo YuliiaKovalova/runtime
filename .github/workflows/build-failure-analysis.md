@@ -42,8 +42,12 @@ on:
         description: "Azure DevOps build id to analyze (dnceng-public/public)."
         required: true
         type: string
+      ado-pr-number:
+        description: "Source dotnet/runtime PR number recorded by the Azure build."
+        required: true
+        type: string
       pr-number:
-        description: "PR number to post the analysis on."
+        description: "Mirrored fork PR number to analyze and post the result on."
         required: true
         type: string
   # Gate the whole AI pipeline on the fetch job so the agent only runs after the
@@ -63,16 +67,10 @@ if: needs.fetch-binlog.outputs.analysis-ready == 'true'
 # agent job stays least-privilege — do NOT raise it to `write`, that would
 # hand PR-write scope to the agent job unnecessarily.
 #
-# Do NOT add `copilot-requests: write` here. That permission switches gh-aw's
-# generated lock from `COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}`
-# to `${{ github.token }}`, and the ephemeral Actions token is not entitled for
-# inference against api.githubcopilot.com in this org — every agent run then
-# dies in ~2s with "Authentication failed with provider ... (HTTP 403)" on both
-# /models and /chat/completions, before it reads the prompt or opens a binlog.
-# `update-default-versions.md` omits it and works; keep this consistent.
 permissions:
   contents: read
   pull-requests: read
+  copilot-requests: write
 
 concurrency:
   # Only real `runtime` check_run events (and manual dispatch for a PR) use a
@@ -91,25 +89,11 @@ network:
     - dotnet
     - dev.azure.com
 
-# ###############################################################
-# Select a PAT from the pool and override COPILOT_GITHUB_TOKEN.
-# Run agentic jobs in an isolated `copilot-pat-pool` environment.
-#
-# When org-level billing is available, this will be removed.
-# See `shared/pat_pool.README.md` for more information.
-# ###############################################################
 imports:
-  - uses: shared/pat_pool.md
-    with:
-      environment: copilot-pat-pool
   - shared/build-failure-analysis-shared.md
-
-environment: copilot-pat-pool
 
 engine:
   id: copilot
-  env:
-    COPILOT_GITHUB_TOKEN: ${{ case(needs.pat_pool.outputs.pat_number == '0', secrets.COPILOT_PAT_0, needs.pat_pool.outputs.pat_number == '1', secrets.COPILOT_PAT_1, needs.pat_pool.outputs.pat_number == '2', secrets.COPILOT_PAT_2, needs.pat_pool.outputs.pat_number == '3', secrets.COPILOT_PAT_3, needs.pat_pool.outputs.pat_number == '4', secrets.COPILOT_PAT_4, needs.pat_pool.outputs.pat_number == '5', secrets.COPILOT_PAT_5, needs.pat_pool.outputs.pat_number == '6', secrets.COPILOT_PAT_6, needs.pat_pool.outputs.pat_number == '7', secrets.COPILOT_PAT_7, needs.pat_pool.outputs.pat_number == '8', secrets.COPILOT_PAT_8, needs.pat_pool.outputs.pat_number == '9', secrets.COPILOT_PAT_9, 'NO COPILOT PAT AVAILABLE') }}
 
 # Live binlog access for the agent. The build-leg binlogs are downloaded from
 # Azure DevOps by the fetch-binlog job into a directory, uploaded as an
@@ -187,6 +171,7 @@ jobs:
           CHECK_HEAD_SHA: ${{ github.event.check_run.head_sha }}
           CHECK_PR_NUMBER: ${{ github.event.check_run.pull_requests[0].number }}
           DISPATCH_BUILD_ID: ${{ inputs['ado-build-id'] }}
+          DISPATCH_ADO_PR_NUMBER: ${{ inputs['ado-pr-number'] }}
           DISPATCH_PR_NUMBER: ${{ inputs['pr-number'] }}
         run: |
           # Advisory + fail-closed: on any validation gap keep the agent inert.
@@ -228,6 +213,7 @@ jobs:
           # --- 2. Resolve the PR number + head SHA ---
           if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
             PR_NUMBER="${DISPATCH_PR_NUMBER}"
+            ADO_PR_NUMBER="${DISPATCH_ADO_PR_NUMBER}"
             HEAD_SHA=""
           else
             # Safe outputs are bound to check_run.pull_requests[0] below. Use
@@ -235,14 +221,19 @@ jobs:
             # absent; the sourceBranch validation in step 4 ensures the ADO
             # build belongs to this exact PR before any analysis can run.
             PR_NUMBER="${CHECK_PR_NUMBER}"
+            ADO_PR_NUMBER="${CHECK_PR_NUMBER}"
             HEAD_SHA="${CHECK_HEAD_SHA}"
           fi
           [ -z "${PR_NUMBER}" ] && { echo "::warning::Could not resolve a PR number."; emit_none; }
+          [ -z "${ADO_PR_NUMBER}" ] && { echo "::warning::Could not resolve an ADO source PR number."; emit_none; }
           # PR_NUMBER feeds `gh api .../pulls/<n>` and the `refs/pull/<n>/merge`
           # comparison; require it numeric so a malformed value can't reach the
           # GitHub API path (traversal-like input) or skew the branch match.
           if ! printf '%s' "${PR_NUMBER}" | grep -qE '^[0-9]+$'; then
             echo "::warning::Resolved PR number '${PR_NUMBER}' is not numeric; refusing."; emit_none
+          fi
+          if ! printf '%s' "${ADO_PR_NUMBER}" | grep -qE '^[0-9]+$'; then
+            echo "::warning::Resolved ADO source PR number '${ADO_PR_NUMBER}' is not numeric; refusing."; emit_none
           fi
 
           # --- 3. Scope check: only analyse PRs targeting main / release/* ---
@@ -256,7 +247,7 @@ jobs:
           [ -z "${BASE_REF}" ] && { echo "::warning::Could not resolve the base ref for PR #${PR_NUMBER} (GitHub API returned no data); treating as a data-resolution failure, not an out-of-scope branch."; emit_none; }
           [ -z "${HEAD_SHA}" ] && HEAD_SHA=$(printf '%s' "${PR_JSON}" | jq -r '.head.sha // empty')
           case "${BASE_REF}" in
-            main|release/*) echo "PR #${PR_NUMBER} base '${BASE_REF}' is in scope." ;;
+            main|release/*|e2e-build-failure-base) echo "PR #${PR_NUMBER} base '${BASE_REF}' is in scope." ;;
             *) echo "::warning::PR #${PR_NUMBER} base '${BASE_REF}' is out of scope (main, release/*); skipping."; emit_none ;;
           esac
 
@@ -275,8 +266,8 @@ jobs:
           if [ "${RESULT}" != "failed" ]; then
             echo "::warning::ADO build ${BUILD_ID} did not fail (result='${RESULT}'); nothing to analyze."; emit_none
           fi
-          if [ "${SRC_BRANCH}" != "refs/pull/${PR_NUMBER}/merge" ]; then
-            echo "::warning::ADO build ${BUILD_ID} sourceBranch '${SRC_BRANCH}' does not match PR #${PR_NUMBER} (refs/pull/${PR_NUMBER}/merge); refusing to avoid posting to the wrong PR."; emit_none
+          if [ "${SRC_BRANCH}" != "refs/pull/${ADO_PR_NUMBER}/merge" ]; then
+            echo "::warning::ADO build ${BUILD_ID} sourceBranch '${SRC_BRANCH}' does not match source PR #${ADO_PR_NUMBER} (refs/pull/${ADO_PR_NUMBER}/merge); refusing."; emit_none
           fi
 
           # Require the build's analyzed revision to equal the PR's CURRENT
@@ -292,11 +283,21 @@ jobs:
           # `merge_commit_sha` then. If the base branch advances (even with the PR
           # head unchanged) GitHub recomputes that merge and merge_commit_sha
           # changes, so this catches base-advance staleness the head check misses.
-          BUILD_MERGE_SHA=$(printf '%s' "${build_json}" | jq -r '.sourceVersion // empty')
+          ADO_BUILD_MERGE_SHA=$(printf '%s' "${build_json}" | jq -r '.sourceVersion // empty')
           CURRENT_MERGE=$(printf '%s' "${PR_JSON}" | jq -r '.merge_commit_sha // empty')
+          # A mirrored fork PR has the same head and base trees but GitHub
+          # creates a different merge commit. Keep the fork merge revision for
+          # the later point-in-time and safe-output checks while still requiring
+          # the Azure build to identify its own non-empty merge revision.
+          if [ "${ADO_PR_NUMBER}" != "${PR_NUMBER}" ]; then
+            echo "E2E mirror: ADO merge '${ADO_BUILD_MERGE_SHA}', fork merge '${CURRENT_MERGE}'."
+            BUILD_MERGE_SHA="${CURRENT_MERGE}"
+          else
+            BUILD_MERGE_SHA="${ADO_BUILD_MERGE_SHA}"
+          fi
           # Fail CLOSED unless both head and merge revisions are known. The
           # merge revision detects a moved base even when the head is stable.
-          if [ -z "${BUILD_PR_SHA}" ] || [ -z "${CURRENT_HEAD}" ] || [ -z "${BUILD_MERGE_SHA}" ] || [ -z "${CURRENT_MERGE}" ]; then
+          if [ -z "${BUILD_PR_SHA}" ] || [ -z "${CURRENT_HEAD}" ] || [ -z "${ADO_BUILD_MERGE_SHA}" ] || [ -z "${BUILD_MERGE_SHA}" ] || [ -z "${CURRENT_MERGE}" ]; then
             echo "::warning::Could not resolve all build/current head and merge revisions; skipping to avoid analyzing stale evidence."
             emit_none
           fi
