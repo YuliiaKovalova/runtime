@@ -119,7 +119,43 @@ mcp-servers:
     container: "mcr.microsoft.com/dotnet-buildtools/prereqs:azurelinux-3.0-binlog-mcp-amd64"
     mounts:
       - "/tmp/binlogs:/data/binlogs:ro"
-    allowed: ["binlog_*"]
+    # The pinned MCP gateway accepts exact names, not prefix globs.
+    allowed:
+      - binlog_analyzer_summary
+      - binlog_assembly_conflicts
+      - binlog_build_graph
+      - binlog_capabilities
+      - binlog_compare
+      - binlog_compiler
+      - binlog_diagnose
+      - binlog_double_writes
+      - binlog_errors
+      - binlog_evaluation_global_properties
+      - binlog_evaluation_properties
+      - binlog_evaluations
+      - binlog_expensive_analyzers
+      - binlog_expensive_projects
+      - binlog_expensive_targets
+      - binlog_expensive_tasks
+      - binlog_explain_property
+      - binlog_files
+      - binlog_imports
+      - binlog_incremental_analysis
+      - binlog_items
+      - binlog_nuget
+      - binlog_overview
+      - binlog_project_target_times
+      - binlog_project_targets
+      - binlog_projects
+      - binlog_properties
+      - binlog_search
+      - binlog_search_files
+      - binlog_search_targets
+      - binlog_target_graph
+      - binlog_target_reasons
+      - binlog_task_details
+      - binlog_tasks_in_target
+      - binlog_warnings
   # Runtime build/test jobs do not always publish a matching build-log
   # artifact. Keep binlog-mcp as the primary analyzer, but let the agent query
   # the verified public Azure DevOps build's failed compile-task logs when a
@@ -852,20 +888,27 @@ steps:
       E2E_MODE: ${{ inputs['e2e-mode'] }}
       E2E_UPSTREAM_FOUND: ${{ needs.fetch-binlog.outputs.binlog-found }}
       E2E_DOWNLOAD: ${{ steps.download_analysis.outcome }}
+      E2E_PLAYBOOK_SHA: 24a03992ce99fe1fd3d37c2ee5b4ebf6c21797884dc528a41df9dee57755346e
     run: |
       count=$(find /tmp/binlogs -maxdepth 1 -type f -name '*.binlog' | wc -l)
       list_count=$(printf '%s' "$GH_AW_BINLOG_LIST" | awk 'NF {n++} END {print n+0}')
+      names=$(find /tmp/binlogs -maxdepth 1 -type f -name '*.binlog' -printf '%f\n' | jq -Rsc 'split("\n") | map(select(length > 0))')
+      playbook=$(sha256sum .github/agents/build-failure-analyst.agent.md | cut -d ' ' -f 1)
+      [ "$playbook" = "$E2E_PLAYBOOK_SHA" ] || {
+        echo "::error::E2E trusted production playbook is missing or changed."; exit 1;
+      }
       sentinel=false
       [ ! -e /tmp/binlogs/e2e-132609-partial.binlog ] || sentinel=true
       jq -n --arg mode "$E2E_MODE" --arg upstream "$E2E_UPSTREAM_FOUND" \
         --arg download "$E2E_DOWNLOAD" --arg path "$GH_AW_BINLOG_PATH" \
         --arg head "$GH_AW_PR_HEAD_SHA" --arg merge "$GH_AW_PR_MERGE_SHA" \
         --argjson count "$count" --argjson list_count "$list_count" \
+        --argjson names "$names" --arg playbook "$playbook" \
         --argjson sentinel "$sentinel" \
         '{mode:$mode,upstream_binlog_found:$upstream,download_outcome:$download,
           exported_first_path:$path,pr_head:$head,pr_merge:$merge,
           binlog_file_count:$count,exported_list_count:$list_count,
-          partial_sentinel_exists:$sentinel}' \
+          partial_sentinel_exists:$sentinel,binlog_names:$names,playbook_sha256:$playbook}' \
         > "${RUNNER_TEMP}/e2e-132609-agent-proof.json"
       cat "${RUNNER_TEMP}/e2e-132609-agent-proof.json"
       case "$E2E_MODE" in
@@ -914,45 +957,6 @@ tools:
 
 safe-outputs:
   needs: [fetch-binlog]
-  steps:
-    - name: Revalidate PR revision before applying queued outputs
-      shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
-        GH_AW_REPO: ${{ github.repository }}
-        PR_NUMBER: ${{ needs.fetch-binlog.outputs.pr-number }}
-        EXPECTED_HEAD: ${{ needs.fetch-binlog.outputs.pr-head-sha }}
-        EXPECTED_MERGE: ${{ needs.fetch-binlog.outputs.pr-merge-sha }}
-        BUILD_ID: ${{ needs.fetch-binlog.outputs.ado-build-id }}
-        ADO_API: "https://dev.azure.com/dnceng-public/public/_apis"
-        ADO_BUILD_DEFINITION_ID: "129"
-        E2E_ADO_PR_NUMBER: "134029"
-      run: |
-        set -euo pipefail
-        if [[ ! "${PR_NUMBER}" =~ ^[0-9]+$ || ! "${BUILD_ID}" =~ ^[0-9]+$ ]]; then
-          echo "::error::Missing or invalid verified PR/build identity before applying outputs."
-          exit 1
-        fi
-        # A rerun can succeed without changing either commit. Revalidate the
-        # latest build as well as the revisions before publishing old failures.
-        latest_build="${RUNNER_TEMP}/build-failure-analysis-latest-build.json"
-        trap 'rm -f "${latest_build}"' EXIT
-        if ! timeout 60 curl -sSL --fail --retry 3 --connect-timeout 10 --max-time 20 --retry-max-time 40 \
-             -o "${latest_build}" \
-             "${ADO_API}/build/builds?definitions=${ADO_BUILD_DEFINITION_ID}&branchName=refs/pull/${E2E_ADO_PR_NUMBER}/merge&queryOrder=queueTimeDescending&\$top=1&api-version=7.1" ||
-           ! jq -e --arg id "${BUILD_ID}" \
-             '.value[0] | (.id | tostring) == $id and .status == "completed" and .result == "failed"' \
-             "${latest_build}" >/dev/null; then
-          echo "::error::Analyzed build is no longer the latest completed failed runtime build, or could not be verified; refusing stale outputs."
-          exit 1
-        fi
-        if [ -z "${EXPECTED_HEAD}" ] || [ -z "${EXPECTED_MERGE}" ] ||
-           ! gh api "repos/${GH_AW_REPO}/pulls/${PR_NUMBER}" |
-             jq -e --arg head "${EXPECTED_HEAD}" --arg merge "${EXPECTED_MERGE}" \
-               '.head.sha == $head and .merge_commit_sha == $merge' >/dev/null; then
-          echo "::error::PR #${PR_NUMBER} moved or could not be verified before applying queued build-analysis outputs."
-          exit 1
-        fi
   messages:
     footer: "> 🤖 **Automated content by GitHub Copilot.** Generated by the [{workflow_name}]({agentic_workflow_url}) workflow.{ai_credits_suffix} · [◷]({history_link})"
   data:

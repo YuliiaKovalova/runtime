@@ -9,6 +9,271 @@
 # re-declare its top-level permissions.
 
 description: "Shared body for build-failure-analysis workflows"
+
+# Callers must not override steps: gh-aw replaces that array rather than merging
+# it. Keep metadata materialization and the final write guard together here.
+safe-outputs:
+  steps:
+    - name: E2E remove metadata immediately before production enrichment
+      if: steps.download-agent-output.outcome == 'success'
+      uses: actions/github-script@v9.0.0
+      env:
+        GH_AW_AGENT_OUTPUT: ${{ steps.setup-agent-output-env.outputs.GH_AW_AGENT_OUTPUT }}
+        E2E_MODE: ${{ (contains(github.event.comment.body, 'e2e-132609:upload-failure') && 'upload-failure') || (contains(github.event.comment.body, 'e2e-132609:download-failure') && 'download-failure') || (contains(github.event.comment.body, 'e2e-132609:fail-before-analysis') && 'fail-before-analysis') || (contains(github.event.comment.body, 'e2e-132609:omit-metadata') && 'omit-metadata') || 'normal' }}
+        E2E_PHASE: before
+      with:
+        script: |
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const crypto = require("node:crypto");
+
+          const outputPath = process.env.GH_AW_AGENT_OUTPUT;
+          const proofPath = path.join(process.env.RUNNER_TEMP, "e2e-132609-metadata-proof.json");
+          const output = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+          const commentTypes = new Set(["add_comment", "create_pull_request_review_comment"]);
+          const marker = /(?:\r?\n)*Structured data:\s*```json\s*([^`]+)```/g;
+          const valid = data => data && typeof data === "object" && !Array.isArray(data) &&
+            Object.keys(data).length === 2 && data.workflow_artifact === "build-failure-analysis" &&
+            data.artifact_kind === "analysis";
+
+          if (!Array.isArray(output.items)) throw new Error("E2E expected an items array.");
+          const comments = output.items.filter(item => commentTypes.has(item.type));
+          if (!comments.some(item => item.type === "add_comment")) throw new Error("E2E requires genuine analysis output, not noop.");
+
+          function withoutMarker(body) {
+            if (typeof body !== "string") throw new Error("E2E comment body must be a string.");
+            return body.replace(marker, (block, text) => valid(JSON.parse(text)) ? "" : block).trimEnd();
+          }
+
+          function projectionHash(value) {
+            const copy = JSON.parse(JSON.stringify(value));
+            for (const item of copy.items) {
+              if (!commentTypes.has(item.type)) continue;
+              delete item.data;
+              item.body = withoutMarker(item.body);
+            }
+            return crypto.createHash("sha256").update(JSON.stringify(copy)).digest("hex");
+          }
+
+          function counts(items) {
+            return {
+              comment_items: items.length,
+              data_fields: items.filter(item => Object.hasOwn(item, "data")).length,
+              rendered_blocks: items.reduce((n, item) => n + [...item.body.matchAll(marker)].length, 0)
+            };
+          }
+
+          if (process.env.E2E_PHASE === "before") {
+            const proof = {
+              mode: process.env.E2E_MODE,
+              omission_applied: process.env.E2E_MODE === "omit-metadata",
+              before: counts(comments),
+              content_and_target_hash: projectionHash(output)
+            };
+            if (proof.omission_applied) {
+              for (const item of comments) {
+                delete item.data;
+                item.body = withoutMarker(item.body);
+              }
+              fs.writeFileSync(outputPath, JSON.stringify(output));
+            }
+            proof.before_production_enrichment = counts(comments);
+            if (proof.omission_applied &&
+                (proof.before_production_enrichment.data_fields !== 0 ||
+                 proof.before_production_enrichment.rendered_blocks !== 0)) {
+              throw new Error("E2E omission did not remove both data and rendered metadata.");
+            }
+            fs.writeFileSync(proofPath, JSON.stringify(proof));
+            console.log(JSON.stringify(proof));
+          } else if (process.env.E2E_PHASE === "after") {
+            const proof = JSON.parse(fs.readFileSync(proofPath, "utf8"));
+            for (const item of comments) {
+              const blocks = [...item.body.matchAll(marker)];
+              if (!valid(item.data) || blocks.length !== 1 || !valid(JSON.parse(blocks[0][1]))) {
+                throw new Error("Production enrichment did not materialize exactly one valid metadata block.");
+              }
+            }
+            if (projectionHash(output) !== proof.content_and_target_hash) {
+              throw new Error("Production enrichment changed analysis content, targets, other items, or errors.");
+            }
+            proof.after_production_enrichment = counts(comments);
+            proof.content_targets_and_errors_preserved = true;
+            fs.writeFileSync(proofPath, JSON.stringify(proof));
+            console.log(JSON.stringify(proof));
+          } else {
+            throw new Error("Unknown E2E metadata probe phase.");
+          }
+    - name: Ensure build-analysis output metadata
+      if: steps.download-agent-output.outcome == 'success'
+      uses: actions/github-script@v9.0.0
+      env:
+        GH_AW_AGENT_OUTPUT: ${{ steps.setup-agent-output-env.outputs.GH_AW_AGENT_OUTPUT }}
+      with:
+        script: |
+          const fs = require("node:fs");
+          const outputPath = process.env.GH_AW_AGENT_OUTPUT;
+          const output = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+          if (!Array.isArray(output.items)) {
+            throw new Error("Build-analysis output must contain an items array.");
+          }
+          for (const item of output.items) {
+            if (item.type !== "add_comment" && item.type !== "create_pull_request_review_comment") {
+              continue;
+            }
+            if (typeof item.body !== "string") {
+              throw new Error("Build-analysis comments must have a string body.");
+            }
+            if (item.data === undefined) {
+              item.data = { workflow_artifact: "build-failure-analysis", artifact_kind: "analysis" };
+            } else if (item.data === null || Array.isArray(item.data) ||
+                       Object.keys(item.data).length !== 2 ||
+                       item.data.workflow_artifact !== "build-failure-analysis" ||
+                       item.data.artifact_kind !== "analysis") {
+              throw new Error("Build-analysis comment metadata does not match the workflow schema.");
+            }
+            // MCP normalizes supplied data into the body, but data is optional
+            // at that boundary. Materialize the same block when it was omitted.
+            const block = "Structured data:\n```json\n" + JSON.stringify(item.data, null, 2) + "\n```";
+            if (!item.body.includes(block)) {
+              item.body += "\n\n" + block;
+            }
+          }
+          fs.writeFileSync(outputPath, JSON.stringify(output));
+    - name: Revalidate PR revision before applying queued outputs
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_AW_REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ needs.fetch-binlog.outputs.pr-number }}
+        EXPECTED_HEAD: ${{ needs.fetch-binlog.outputs.pr-head-sha }}
+        EXPECTED_MERGE: ${{ needs.fetch-binlog.outputs.pr-merge-sha }}
+        BUILD_ID: ${{ needs.fetch-binlog.outputs.ado-build-id }}
+        ADO_API: "https://dev.azure.com/dnceng-public/public/_apis"
+        ADO_BUILD_DEFINITION_ID: "129"
+        E2E_ADO_PR_NUMBER: "134029"
+      run: |
+        set -euo pipefail
+        if [[ ! "${PR_NUMBER}" =~ ^[0-9]+$ || ! "${BUILD_ID}" =~ ^[0-9]+$ ]]; then
+          echo "::error::Missing or invalid verified PR/build identity before applying outputs."
+          exit 1
+        fi
+        # A rerun can succeed without changing either commit. Revalidate the
+        # latest build as well as the revisions before publishing old failures.
+        latest_build="${RUNNER_TEMP}/build-failure-analysis-latest-build.json"
+        trap 'rm -f "${latest_build}"' EXIT
+        if ! timeout 60 curl -sSL --fail --retry 3 --connect-timeout 10 --max-time 20 --retry-max-time 40 \
+             -o "${latest_build}" \
+             "${ADO_API}/build/builds?definitions=${ADO_BUILD_DEFINITION_ID}&branchName=refs/pull/${E2E_ADO_PR_NUMBER}/merge&queryOrder=queueTimeDescending&\$top=1&api-version=7.1" ||
+           ! jq -e --arg id "${BUILD_ID}" \
+             '.value[0] | (.id | tostring) == $id and .status == "completed" and .result == "failed"' \
+             "${latest_build}" >/dev/null; then
+          echo "::error::Analyzed build is no longer the latest completed failed runtime build, or could not be verified; refusing stale outputs."
+          exit 1
+        fi
+        if [ -z "${EXPECTED_HEAD}" ] || [ -z "${EXPECTED_MERGE}" ] ||
+           ! gh api "repos/${GH_AW_REPO}/pulls/${PR_NUMBER}" |
+             jq -e --arg head "${EXPECTED_HEAD}" --arg merge "${EXPECTED_MERGE}" \
+               '.head.sha == $head and .merge_commit_sha == $merge' >/dev/null; then
+          echo "::error::PR #${PR_NUMBER} moved or could not be verified before applying queued build-analysis outputs."
+          exit 1
+        fi
+    - name: E2E verify production metadata enrichment
+      if: steps.download-agent-output.outcome == 'success'
+      uses: actions/github-script@v9.0.0
+      env:
+        GH_AW_AGENT_OUTPUT: ${{ steps.setup-agent-output-env.outputs.GH_AW_AGENT_OUTPUT }}
+        E2E_MODE: ${{ (contains(github.event.comment.body, 'e2e-132609:upload-failure') && 'upload-failure') || (contains(github.event.comment.body, 'e2e-132609:download-failure') && 'download-failure') || (contains(github.event.comment.body, 'e2e-132609:fail-before-analysis') && 'fail-before-analysis') || (contains(github.event.comment.body, 'e2e-132609:omit-metadata') && 'omit-metadata') || 'normal' }}
+        E2E_PHASE: after
+      with:
+        script: |
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const crypto = require("node:crypto");
+
+          const outputPath = process.env.GH_AW_AGENT_OUTPUT;
+          const proofPath = path.join(process.env.RUNNER_TEMP, "e2e-132609-metadata-proof.json");
+          const output = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+          const commentTypes = new Set(["add_comment", "create_pull_request_review_comment"]);
+          const marker = /(?:\r?\n)*Structured data:\s*```json\s*([^`]+)```/g;
+          const valid = data => data && typeof data === "object" && !Array.isArray(data) &&
+            Object.keys(data).length === 2 && data.workflow_artifact === "build-failure-analysis" &&
+            data.artifact_kind === "analysis";
+
+          if (!Array.isArray(output.items)) throw new Error("E2E expected an items array.");
+          const comments = output.items.filter(item => commentTypes.has(item.type));
+          if (!comments.some(item => item.type === "add_comment")) throw new Error("E2E requires genuine analysis output, not noop.");
+
+          function withoutMarker(body) {
+            if (typeof body !== "string") throw new Error("E2E comment body must be a string.");
+            return body.replace(marker, (block, text) => valid(JSON.parse(text)) ? "" : block).trimEnd();
+          }
+
+          function projectionHash(value) {
+            const copy = JSON.parse(JSON.stringify(value));
+            for (const item of copy.items) {
+              if (!commentTypes.has(item.type)) continue;
+              delete item.data;
+              item.body = withoutMarker(item.body);
+            }
+            return crypto.createHash("sha256").update(JSON.stringify(copy)).digest("hex");
+          }
+
+          function counts(items) {
+            return {
+              comment_items: items.length,
+              data_fields: items.filter(item => Object.hasOwn(item, "data")).length,
+              rendered_blocks: items.reduce((n, item) => n + [...item.body.matchAll(marker)].length, 0)
+            };
+          }
+
+          if (process.env.E2E_PHASE === "before") {
+            const proof = {
+              mode: process.env.E2E_MODE,
+              omission_applied: process.env.E2E_MODE === "omit-metadata",
+              before: counts(comments),
+              content_and_target_hash: projectionHash(output)
+            };
+            if (proof.omission_applied) {
+              for (const item of comments) {
+                delete item.data;
+                item.body = withoutMarker(item.body);
+              }
+              fs.writeFileSync(outputPath, JSON.stringify(output));
+            }
+            proof.before_production_enrichment = counts(comments);
+            if (proof.omission_applied &&
+                (proof.before_production_enrichment.data_fields !== 0 ||
+                 proof.before_production_enrichment.rendered_blocks !== 0)) {
+              throw new Error("E2E omission did not remove both data and rendered metadata.");
+            }
+            fs.writeFileSync(proofPath, JSON.stringify(proof));
+            console.log(JSON.stringify(proof));
+          } else if (process.env.E2E_PHASE === "after") {
+            const proof = JSON.parse(fs.readFileSync(proofPath, "utf8"));
+            for (const item of comments) {
+              const blocks = [...item.body.matchAll(marker)];
+              if (!valid(item.data) || blocks.length !== 1 || !valid(JSON.parse(blocks[0][1]))) {
+                throw new Error("Production enrichment did not materialize exactly one valid metadata block.");
+              }
+            }
+            if (projectionHash(output) !== proof.content_and_target_hash) {
+              throw new Error("Production enrichment changed analysis content, targets, other items, or errors.");
+            }
+            proof.after_production_enrichment = counts(comments);
+            proof.content_targets_and_errors_preserved = true;
+            fs.writeFileSync(proofPath, JSON.stringify(proof));
+            console.log(JSON.stringify(proof));
+          } else {
+            throw new Error("Unknown E2E metadata probe phase.");
+          }
+    - name: E2E upload sanitized metadata proof
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: e2e-132609-metadata-proof
+        path: ${{ runner.temp }}/e2e-132609-metadata-proof.json
+        if-no-files-found: error
+        retention-days: 7
+
 ---
 
 # Build Failure Analyst
