@@ -22,7 +22,7 @@
     },
     ".github/workflows/build-failure-analysis-command.md": {
       "production_sha256": "e65fd400b78c3dcd03384a2fb392041e3a4ebf3e38d4d3b428209c0ddc19cae9",
-      "harness_sha256": "804a6d507a86da4e6e46efb8415210cd77de0392c526beed80b6fd2999ea1a80",
+      "harness_sha256": "d303be904de381c03f8af7c4503e74f79eb7315bb3027a5feb0bc89362474cbc",
       "adapted": true
     },
     ".github/agents/build-failure-analyst.agent.md": {
@@ -50,6 +50,7 @@
     "Actual upload/download action failures injected only via path/name inputs; no outcomes or production output flags are overwritten.",
     "Named inert partial-download sentinel and assertions exercise unchanged production cleanup.",
     "Sanitized outcome/count evidence and a pre-analysis failure step support verification without exposing environment credentials.",
-    "Run titles carry test mode/comment ID for deterministic tracking."
+    "Run titles carry test mode/comment ID for deterministic tracking.",
+    "Command checkout uses supported checkout:false plus explicit immutable fork checkout and trusted .github restoration; gh-aw v0.86.2 refuses its implicit PR checkout inside any fork."
   ]
 }

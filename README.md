@@ -35,6 +35,13 @@ idempotency predicate are unchanged. Command comments carry a visible AI note.
 Raw EOF-only parser coverage is local, because a public command comment must
 also carry that disclosure.
 
+The first actual command exposed an additional gh-aw v0.86.2 limitation:
+its implicit PR checkout refuses any fork runtime. The command harness uses
+the supported `checkout: false` option and explicit immutable fork checkout
+instead, restoring the trusted proof commit's `.github` controls afterward.
+Repository, PR number, and head are checked before that checkout. This does
+not change production checkout policy, event data, or runtime library code.
+
 Artifact faults use only test-only action inputs:
 
 - `upload-failure`: real binlogs are staged, but the actual upload action receives

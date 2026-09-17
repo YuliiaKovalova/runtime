@@ -68,6 +68,29 @@ imports:
 engine:
   id: copilot
 
+# E2E: the framework's implicit PR checkout refuses every fork runtime.
+checkout: false
+pre-steps:
+  - name: E2E checkout immutable workflow controls
+    uses: actions/checkout@v7.0.1
+    with:
+      ref: ${{ github.sha }}
+      persist-credentials: false
+  - name: E2E checkout pinned mirror and restore trusted controls
+    shell: bash
+    env:
+      E2E_REPOSITORY: ${{ github.repository }}
+      E2E_PR: ${{ github.event.issue.number }}
+      E2E_HEAD: ${{ needs.fetch-binlog.outputs.pr-head-sha }}
+      E2E_CONTROL: ${{ github.sha }}
+    run: |
+      [ "$E2E_REPOSITORY" = YuliiaKovalova/runtime ] && [ "$E2E_PR" = 2 ]
+      [ "$E2E_HEAD" = b49e9e219e667ed931ce7dcac6bafc295f1021e7 ]
+      git -c credential.helper= fetch --no-tags --depth=2 origin "$E2E_HEAD"
+      git checkout --detach "$E2E_HEAD"
+      [ "$(git rev-parse HEAD)" = "$E2E_HEAD" ]
+      git restore --source "$E2E_CONTROL" --staged --worktree -- .github
+
 # Live binlog access for the agent — see build-failure-analysis.md for the
 # rationale. The fetch-binlog job downloads failed-job binlogs from Azure
 # DevOps into a directory and uploads them; the agent job downloads them to
