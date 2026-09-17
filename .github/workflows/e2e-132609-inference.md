@@ -24,7 +24,8 @@ network:
     - defaults
 
 tools:
-  bash: false
+  bash:
+    - "safeoutputs:*"
   edit: false
 
 safe-outputs:
@@ -48,10 +49,10 @@ safe-outputs:
 This is an AI-generated, fork-only inference entitlement probe, not a build
 failure analysis or production workflow test.
 
-Do not read repository files, execute shell commands, or call external APIs.
-Call the safe-output `add_comment` tool exactly once with this body, then stop:
+Do not read repository files, execute other shell commands, or call external
+APIs. Submit the final intended status comment with this exact safe-output CLI
+command once, then stop:
 
-`e2e-132609 inference entitlement confirmed`
-
-This verifies only fork Actions-token Copilot inference. It does not test the
-production build-failure workflows and does not request a runtime or Azure build.
+```bash
+safeoutputs add_comment --body "e2e-132609 inference entitlement confirmed. This verifies only fork Actions-token Copilot inference, not the production build-failure workflows. No runtime or Azure build was requested."
+```
